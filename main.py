@@ -1,247 +1,207 @@
 import os
-import re
-import sys
-import time
 import logging
-from datetime import datetime, date
-from zoneinfo import ZoneInfo
-from urllib.parse import urljoin
+import tempfile
+from pathlib import Path
 
+import fitz  # PyMuPDF
 import requests
-import fitz
-from bs4 import BeautifulSoup
-from telegram import Bot, InputMediaPhoto
+from flask import Flask, request, jsonify
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(message)s"
+    format="%(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("yadanabon-bot")
+log = logging.getLogger("pdf-jpg-bot")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "30"))
-RENDER_DPI = int(os.getenv("RENDER_DPI", "160"))
-MYAWADY_INDEX_URL = os.getenv(
-    "MYAWADY_INDEX_URL",
-    "https://myawady.net.mm/pdf-file-amiuacaarern/rttnaapunsttngcaa"
-)
-REQUEST_TIMEOUT = 30
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; YadanabonDailyNewsBot/1.0)"}
-STATE_FILE = os.getenv("STATE_FILE", "state/posted_dates.txt")
-TEMP_DIR = "/tmp/yadanabon_bot"
-os.makedirs(TEMP_DIR, exist_ok=True)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+RENDER_DPI = max(100, min(int(os.getenv("RENDER_DPI", "160")), 300))
+MAX_PDF_MB = max(1, int(os.getenv("MAX_PDF_MB", "40")))
+PORT = int(os.getenv("PORT", "10000"))
 
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN environment variable")
+if not CHANNEL_ID:
+    raise RuntimeError("Missing CHANNEL_ID environment variable")
+if not RENDER_EXTERNAL_URL:
+    raise RuntimeError(
+        "Missing RENDER_EXTERNAL_URL. Deploy this as a Render Web Service so Render sets it."
+    )
 
-def myanmar_today():
-    return datetime.now(ZoneInfo("Asia/Yangon")).date()
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
 
-
-def today_candidates(target):
-    d, m, y = target.day, target.month, target.year
-    return [
-        f"https://myawady.net.mm/{d}-{m}-{y}-rttnaapunsttngcaa",
-        f"https://www.myawady.net.mm/{d}-{m}-{y}-rttnaapunsttngcaa",
-        f"https://myawady.net.mm/index.php/{d}-{m}-{y}-rttnaapunsttngcaa",
-        f"https://www.myawady.net.mm/index.php/{d}-{m}-{y}-rttnaapunsttngcaa",
-    ]
+app = Flask(__name__)
+session = requests.Session()
+session.headers.update({"User-Agent": "YadanabonPDFtoJPGBot/1.0"})
 
 
-def fetch_html(url):
-    response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    if response.status_code == 404:
-        return None
+def telegram(method, data=None, files=None, timeout=60):
+    response = session.post(
+        f"{API}/{method}", data=data, files=files, timeout=timeout
+    )
     response.raise_for_status()
-    return response.text
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API {method} failed: {result}")
+    return result["result"]
 
 
-def page_date_matches(text, target):
-    d, m, y = target.day, target.month, target.year
-    patterns = [
-        rf"(?<!\d)0?{d}\s*[-/\.]\s*0?{m}\s*[-/\.]\s*{y}(?!\d)",
-        rf"(?<!\d){y}\s*[-/\.]\s*0?{m}\s*[-/\.]\s*0?{d}(?!\d)",
-    ]
-    return any(re.search(p, text) for p in patterns)
+def send_message(chat_id, text):
+    telegram("sendMessage", {"chat_id": chat_id, "text": text})
 
 
-def find_pdf_link(html, page_url, target):
-    soup = BeautifulSoup(html, "html.parser")
-    visible_text = soup.get_text(" ", strip=True)
-    title = soup.title.get_text(" ", strip=True) if soup.title else ""
-    date_evidence = page_date_matches(title + " " + visible_text, target)
-    url_evidence = f"/{target.day}-{target.month}-{target.year}-" in page_url
-
-    candidates = []
-    for a in soup.find_all("a", href=True):
-        href = urljoin(page_url, a["href"])
-        label = (a.get_text(" ", strip=True) + " " + href).lower()
-        if ".pdf" in href.lower():
-            if any(word in label for word in ["rttna", "ydnp", "yad", "newspaper", "သတင်းစာ"]):
-                candidates.insert(0, href)
-            else:
-                candidates.append(href)
-
-    for tag in soup.find_all(["iframe", "embed", "object"]):
-        src = tag.get("src") or tag.get("data")
-        if src:
-            href = urljoin(page_url, src)
-            if ".pdf" in href.lower():
-                candidates.append(href)
-
-    if date_evidence or url_evidence:
-        return candidates[0] if candidates else None
-    return None
+def set_webhook():
+    payload = {"url": WEBHOOK_URL, "allowed_updates": ["message"]}
+    if WEBHOOK_SECRET:
+        payload["secret_token"] = WEBHOOK_SECRET
+    result = telegram("setWebhook", payload)
+    log.info("Telegram webhook configured: %s; result=%s", WEBHOOK_URL, result)
 
 
-def discover_today_pdf():
-    target = myanmar_today()
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    for page_url in today_candidates(target):
-        try:
-            response = session.get(page_url, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 404:
-                continue
-            response.raise_for_status()
-            pdf_url = find_pdf_link(response.text, page_url, target)
-            if pdf_url:
-                log.info("Found today's PDF: %s", pdf_url)
-                return pdf_url
-        except Exception as exc:
-            log.warning("Could not check %s: %s", page_url, exc)
-
-    try:
-        response = session.get(MYAWADY_INDEX_URL, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
-        seen = set()
-        for a in soup.find_all("a", href=True):
-            href = urljoin(MYAWADY_INDEX_URL, a["href"])
-            label = a.get_text(" ", strip=True)
-            if href in seen:
-                continue
-            seen.add(href)
-            if "rttnaapunsttngcaa" not in href.lower() and "ရတနာပုံ" not in label:
-                continue
-            if not page_date_matches(label + " " + href, target):
-                continue
-            html = fetch_html(href)
-            if html:
-                pdf_url = find_pdf_link(html, href, target)
-                if pdf_url:
-                    log.info("Found today's PDF: %s", pdf_url)
-                    return pdf_url
-    except Exception as exc:
-        log.warning("Index scan failed: %s", exc)
-
-    return None
+def get_pdf_file(file_id):
+    result = telegram("getFile", {"file_id": file_id})
+    file_path = result.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram did not return a file_path")
+    url = f"{FILE_API}/{file_path}"
+    response = session.get(url, stream=True, timeout=120)
+    response.raise_for_status()
+    content_length = response.headers.get("Content-Length")
+    if content_length and int(content_length) > MAX_PDF_MB * 1024 * 1024:
+        raise ValueError(f"PDF is larger than {MAX_PDF_MB} MB")
+    data = bytearray()
+    for chunk in response.iter_content(chunk_size=1024 * 1024):
+        if chunk:
+            data.extend(chunk)
+            if len(data) > MAX_PDF_MB * 1024 * 1024:
+                raise ValueError(f"PDF is larger than {MAX_PDF_MB} MB")
+    if not data.startswith(b"%PDF"):
+        raise ValueError("The received file does not look like a PDF")
+    return bytes(data)
 
 
-def load_posted_dates():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return set(line.strip() for line in f if line.strip())
-    except FileNotFoundError:
-        return set()
-
-
-def save_posted_date(day_key):
-    parent = os.path.dirname(STATE_FILE)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(STATE_FILE, "a", encoding="utf-8") as f:
-        f.write(day_key + "\n")
-
-
-def download_pdf(url, day_key):
-    path = os.path.join(TEMP_DIR, f"{day_key}.pdf")
-    with requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, stream=True) as r:
-        r.raise_for_status()
-        content_type = r.headers.get("content-type", "").lower()
-        first_chunk = True
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024 * 128):
-                if not chunk:
-                    continue
-                if first_chunk:
-                    first_chunk = False
-                    if not (chunk.startswith(b"%PDF") or "pdf" in content_type):
-                        raise ValueError("Downloaded file does not appear to be a PDF.")
-                f.write(chunk)
-    if os.path.getsize(path) < 1000:
-        raise ValueError("Downloaded PDF is unexpectedly small.")
-    return path
-
-
-def convert_pdf_to_jpg(pdf_path, day_key):
-    doc = fitz.open(pdf_path)
+def pdf_to_jpegs(pdf_bytes, output_dir):
+    pdf_path = Path(output_dir) / "input.pdf"
+    pdf_path.write_bytes(pdf_bytes)
     output_paths = []
-    matrix = fitz.Matrix(RENDER_DPI / 72, RENDER_DPI / 72)
-    for index, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        out_path = os.path.join(TEMP_DIR, f"{day_key}_page_{index + 1:03d}.jpg")
-        pix.save(out_path, jpg_quality=90)
-        output_paths.append(out_path)
-    doc.close()
+    scale = RENDER_DPI / 72
+    matrix = fitz.Matrix(scale, scale)
+    with fitz.open(pdf_path) as doc:
+        if doc.page_count < 1:
+            raise ValueError("PDF has no pages")
+        if doc.page_count > 500:
+            raise ValueError("PDF has more than 500 pages; refusing to process it")
+        for index, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            output_path = Path(output_dir) / f"page_{index + 1:04d}.jpg"
+            pix.save(output_path, jpg_quality=88)
+            output_paths.append(output_path)
     return output_paths
 
 
-def post_images(bot, image_paths, day_key):
-    total = len(image_paths)
-    display_date = datetime.strptime(day_key, "%Y-%m-%d").strftime("%d-%m-%Y")
-    for start in range(0, total, 10):
-        batch = image_paths[start:start + 10]
-        media = []
+def post_jpegs(paths, caption):
+    # Telegram media groups allow at most 10 items per group.
+    for start in range(0, len(paths), 10):
+        batch = paths[start:start + 10]
         opened = []
+        media = []
         try:
-            for offset, path in enumerate(batch):
-                f = open(path, "rb")
-                opened.append(f)
-                page_number = start + offset + 1
-                caption = f"ရတနာပုံသတင်းစာ — {display_date}\nစာမျက်နှာ {page_number}/{total}" if offset == 0 else None
-                media.append(InputMediaPhoto(media=f, caption=caption))
-            bot.send_media_group(
-                chat_id=CHANNEL_ID, media=media,
-                read_timeout=120, write_timeout=120
+            for i, path in enumerate(batch):
+                handle = open(path, "rb")
+                opened.append(handle)
+                item = {"type": "photo", "media": f"attach://photo{i}"}
+                if start == 0 and i == 0 and caption:
+                    item["caption"] = caption[:1024]
+                media.append(item)
+            multipart = {f"photo{i}": handle for i, handle in enumerate(opened)}
+            telegram(
+                "sendMediaGroup",
+                {"chat_id": CHANNEL_ID, "media": __import__("json").dumps(media)},
+                files=multipart,
+                timeout=180,
             )
-            time.sleep(2)
         finally:
-            for f in opened:
-                f.close()
+            for handle in opened:
+                handle.close()
 
 
-def run_once():
-    target = myanmar_today()
-    day_key = target.strftime("%Y-%m-%d")
-    if day_key in load_posted_dates():
-        log.info("Already posted for Myanmar date %s; skipping.", day_key)
+def process_document(message):
+    chat_id = message["chat"]["id"]
+    document = message.get("document") or {}
+    filename = document.get("file_name", "document.pdf")
+    mime_type = document.get("mime_type", "")
+    file_id = document.get("file_id")
+    if not file_id:
+        send_message(chat_id, "ဖိုင်ကို မဖတ်နိုင်ပါ။ PDF ဖိုင်ကို ပြန်ပို့ပေးပါ။")
+        return
+    if not filename.lower().endswith(".pdf") and mime_type != "application/pdf":
+        send_message(chat_id, "PDF ဖိုင်ကိုပဲ ပို့ပေးပါ။")
+        return
+    size = int(document.get("file_size") or 0)
+    if size > MAX_PDF_MB * 1024 * 1024:
+        send_message(chat_id, f"PDF ဖိုင်က {MAX_PDF_MB} MB ထက်ကြီးနေပါတယ်။")
         return
 
-    pdf_url = discover_today_pdf()
-    if not pdf_url:
-        log.info("Today's PDF not found yet (%s). No post made; next scheduled run will retry.", day_key)
-        return
+    send_message(chat_id, "PDF လက်ခံရရှိပါပြီ။ JPG ပုံတွေပြောင်းပြီး Channel မှာ တင်နေပါတယ်။")
+    try:
+        pdf_bytes = get_pdf_file(file_id)
+        with tempfile.TemporaryDirectory(prefix="pdf-jpg-") as tmp:
+            paths = pdf_to_jpegs(pdf_bytes, tmp)
+            caption = f"{filename} — စာမျက်နှာ {len(paths)} မျက်နှာ"
+            post_jpegs(paths, caption)
+        send_message(chat_id, f"ပြီးပါပြီ။ JPG ပုံ {len(paths)} ပုံကို Channel မှာ တင်ပြီးပါပြီ။")
+    except Exception:
+        log.exception("Failed to process PDF")
+        send_message(
+            chat_id,
+            "PDF ပြောင်းပြီး Channel တင်ရာမှာ အမှားဖြစ်သွားပါတယ်။ "
+            "Render Logs ကို စစ်ဆေးပေးပါ။",
+        )
 
-    pdf_path = download_pdf(pdf_url, day_key)
-    image_paths = convert_pdf_to_jpg(pdf_path, day_key)
-    if not image_paths:
-        raise RuntimeError("PDF conversion returned no images.")
 
-    bot = Bot(token=BOT_TOKEN)
-    post_images(bot, image_paths, day_key)
-    save_posted_date(day_key)
-    log.info("Posted %s (%d pages).", day_key, len(image_paths))
+@app.get("/")
+def health():
+    return jsonify({"status": "ok", "service": "pdf-to-jpg-telegram-bot"}), 200
 
 
-def main():
-    if "--once" in sys.argv:
-        run_once()
-        return
+@app.post("/telegram-webhook")
+def telegram_webhook():
+    if WEBHOOK_SECRET:
+        provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if provided != WEBHOOK_SECRET:
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
+    update = request.get_json(silent=True) or {}
+    message = update.get("message")
+    if message and message.get("document"):
+        process_document(message)
+    elif message and message.get("text") == "/start":
+        send_message(
+            message["chat"]["id"],
+            "မင်္ဂလာပါ။ သတင်းစာ PDF ဖိုင်ကို ဒီ Bot ဆီ ပို့ပါ။ "
+            "JPG ပုံပြောင်းပြီး သတ်မှတ်ထားတဲ့ Channel မှာ တင်ပေးပါမယ်။",
+        )
+    return jsonify({"ok": True}), 200
 
-    log.info("This project is designed for scheduled GitHub Actions runs. Use: python main.py --once")
-    run_once()
+
+@app.post("/configure-webhook")
+def configure_webhook():
+    # Optional manual endpoint for troubleshooting; protect with WEBHOOK_SECRET if configured.
+    if WEBHOOK_SECRET:
+        provided = request.headers.get("X-Webhook-Secret", "")
+        if provided != WEBHOOK_SECRET:
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
+    try:
+        set_webhook()
+        return jsonify({"ok": True, "webhook_url": WEBHOOK_URL}), 200
+    except Exception as exc:
+        log.exception("Could not configure webhook")
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 if __name__ == "__main__":
-    main()
+    set_webhook()
+    app.run(host="0.0.0.0", port=PORT)
