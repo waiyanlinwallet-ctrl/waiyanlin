@@ -3,11 +3,12 @@ import re
 import sys
 import time
 import logging
-from datetime import datetime, date
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, unquote
 
 import requests
+import certifi
 import fitz
 from bs4 import BeautifulSoup
 from telegram import Bot, InputMediaPhoto
@@ -27,10 +28,22 @@ MYAWADY_INDEX_URL = os.getenv(
     "https://myawady.net.mm/pdf-file-amiuacaarern/rttnaapunsttngcaa"
 )
 REQUEST_TIMEOUT = 30
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; YadanabonDailyNewsBot/1.0)"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    )
+}
 STATE_FILE = os.getenv("STATE_FILE", "state/posted_dates.txt")
 TEMP_DIR = "/tmp/yadanabon_bot"
 os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Verify TLS certificates normally. A TLS bypass is intentionally NOT used:
+# disabling certificate checks could allow a fake page/PDF to be downloaded.
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+SESSION.verify = certifi.where()
 
 
 def myanmar_today():
@@ -40,19 +53,28 @@ def myanmar_today():
 def today_candidates(target):
     d, m, y = target.day, target.month, target.year
     return [
+        f"https://myawady.net.mm/{d}-{m}-{y}-rttnaapunsttngcaa-0",
+        f"https://www.myawady.net.mm/{d}-{m}-{y}-rttnaapunsttngcaa-0",
         f"https://myawady.net.mm/{d}-{m}-{y}-rttnaapunsttngcaa",
         f"https://www.myawady.net.mm/{d}-{m}-{y}-rttnaapunsttngcaa",
+        f"https://myawady.net.mm/index.php/{d}-{m}-{y}-rttnaapunsttngcaa-0",
+        f"https://www.myawady.net.mm/index.php/{d}-{m}-{y}-rttnaapunsttngcaa-0",
         f"https://myawady.net.mm/index.php/{d}-{m}-{y}-rttnaapunsttngcaa",
         f"https://www.myawady.net.mm/index.php/{d}-{m}-{y}-rttnaapunsttngcaa",
     ]
 
 
-def fetch_html(url):
-    response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+def fetch_response(url):
+    response = SESSION.get(url, timeout=REQUEST_TIMEOUT)
     if response.status_code == 404:
         return None
     response.raise_for_status()
-    return response.text
+    return response
+
+
+def fetch_html(url):
+    response = fetch_response(url)
+    return response.text if response is not None else None
 
 
 def page_date_matches(text, target):
@@ -64,74 +86,148 @@ def page_date_matches(text, target):
     return any(re.search(p, text) for p in patterns)
 
 
+def _looks_like_pdf_url(url):
+    path = unquote(urlparse(url).path).lower()
+    return (
+        path.endswith(".pdf")
+        or ".pdf?" in url.lower()
+        or "download" in path
+        or "pdf" in path
+    )
+
+
+def _pdf_candidates_from_html(html, page_url):
+    """Collect PDF links, embedded viewer URLs and PDF.js-style file parameters."""
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+
+    def add(value):
+        if not value:
+            return
+        value = value.strip().replace("&amp;", "&")
+        if value.startswith(("javascript:", "data:", "#")):
+            return
+        full = urljoin(page_url, value)
+        if full not in found:
+            found.append(full)
+
+    for tag in soup.find_all(["a", "iframe", "embed", "object", "source"]):
+        for attr in ("href", "src", "data"):
+            add(tag.get(attr))
+
+    # Some PDF viewers keep the actual file URL in a query parameter, e.g. ?file=...
+    for tag in soup.find_all(True):
+        for attr in ("data-url", "data-file", "data-pdf", "data-document-url"):
+            add(tag.get(attr))
+
+    # Inspect script text for common PDF file paths and PDF viewer config.
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text(" ", strip=True)
+        if not text:
+            continue
+        patterns = [
+            r"""["']([^"'<>\\\s]+\.pdf(?:\?[^"'<>\\\s]*)?)["']""",
+            r"""(?:file|url|pdfUrl|pdf_url)\s*[:=]\s*["']([^"']+)["']""",
+        ]
+        for pattern in patterns:
+            for match in re.findall(pattern, text, flags=re.IGNORECASE):
+                add(match.replace("\\/", "/"))
+
+    # Prefer actual PDF-looking paths, then viewer URLs as a fallback.
+    pdf_like = [u for u in found if _looks_like_pdf_url(u)]
+    other_embeds = [
+        u for u in found
+        if any(word in u.lower() for word in ("pdf", "viewer", "document"))
+    ]
+    return pdf_like + [u for u in other_embeds if u not in pdf_like]
+
+
 def find_pdf_link(html, page_url, target):
     soup = BeautifulSoup(html, "html.parser")
     visible_text = soup.get_text(" ", strip=True)
     title = soup.title.get_text(" ", strip=True) if soup.title else ""
     date_evidence = page_date_matches(title + " " + visible_text, target)
-    url_evidence = f"/{target.day}-{target.month}-{target.year}-" in page_url
+    url_evidence = (
+        f"/{target.day}-{target.month}-{target.year}-" in page_url
+        or f"{target.day}-{target.month}-{target.year}-" in page_url
+    )
+    if not (date_evidence or url_evidence):
+        return None
 
-    candidates = []
-    for a in soup.find_all("a", href=True):
-        href = urljoin(page_url, a["href"])
-        label = (a.get_text(" ", strip=True) + " " + href).lower()
-        if ".pdf" in href.lower():
-            if any(word in label for word in ["rttna", "ydnp", "yad", "newspaper", "သတင်းစာ"]):
-                candidates.insert(0, href)
-            else:
-                candidates.append(href)
+    candidates = _pdf_candidates_from_html(html, page_url)
+    if not candidates:
+        return None
 
-    for tag in soup.find_all(["iframe", "embed", "object"]):
-        src = tag.get("src") or tag.get("data")
-        if src:
-            href = urljoin(page_url, src)
-            if ".pdf" in href.lower():
-                candidates.append(href)
-
-    if date_evidence or url_evidence:
-        return candidates[0] if candidates else None
+    # Try candidates in preferred order; only accept URLs that return PDF bytes.
+    for candidate in candidates:
+        try:
+            with SESSION.get(
+                candidate, timeout=REQUEST_TIMEOUT, stream=True,
+                headers={"Range": "bytes=0-1023"}
+            ) as response:
+                if response.status_code not in (200, 206):
+                    continue
+                content_type = response.headers.get("content-type", "").lower()
+                first = next(response.iter_content(chunk_size=1024), b"")
+                if first.startswith(b"%PDF") or "application/pdf" in content_type:
+                    return candidate
+        except requests.RequestException as exc:
+            log.debug("Candidate is not a directly reachable PDF (%s): %s", candidate, exc)
     return None
 
 
 def discover_today_pdf():
     target = myanmar_today()
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    seen_pages = set()
 
     for page_url in today_candidates(target):
+        if page_url in seen_pages:
+            continue
+        seen_pages.add(page_url)
         try:
-            response = session.get(page_url, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 404:
+            response = fetch_response(page_url)
+            if response is None:
                 continue
-            response.raise_for_status()
-            pdf_url = find_pdf_link(response.text, page_url, target)
+            pdf_url = find_pdf_link(response.text, response.url, target)
             if pdf_url:
                 log.info("Found today's PDF: %s", pdf_url)
                 return pdf_url
+        except requests.exceptions.SSLError as exc:
+            log.error(
+                "TLS certificate verification failed for %s. "
+                "Will not disable TLS verification automatically: %s",
+                page_url, exc
+            )
         except Exception as exc:
             log.warning("Could not check %s: %s", page_url, exc)
 
     try:
-        response = session.get(MYAWADY_INDEX_URL, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
+        response = fetch_response(MYAWADY_INDEX_URL)
+        if response is None:
+            return None
         soup = BeautifulSoup(response.text, "html.parser")
-        seen = set()
+        page_candidates = []
         for a in soup.find_all("a", href=True):
-            href = urljoin(MYAWADY_INDEX_URL, a["href"])
+            href = urljoin(response.url, a["href"])
             label = a.get_text(" ", strip=True)
-            if href in seen:
-                continue
-            seen.add(href)
-            if "rttnaapunsttngcaa" not in href.lower() and "ရတနာပုံ" not in label:
-                continue
-            if not page_date_matches(label + " " + href, target):
-                continue
-            html = fetch_html(href)
-            if html:
-                pdf_url = find_pdf_link(html, href, target)
-                if pdf_url:
-                    log.info("Found today's PDF: %s", pdf_url)
-                    return pdf_url
+            if (
+                "rttnaapunsttngcaa" in href.lower()
+                or "ရတနာပုံ" in label
+            ) and page_date_matches(label + " " + href, target):
+                page_candidates.append(href)
+
+        for href in dict.fromkeys(page_candidates):
+            try:
+                html = fetch_html(href)
+                if html:
+                    pdf_url = find_pdf_link(html, href, target)
+                    if pdf_url:
+                        log.info("Found today's PDF: %s", pdf_url)
+                        return pdf_url
+            except Exception as exc:
+                log.warning("Could not inspect index result %s: %s", href, exc)
+    except requests.exceptions.SSLError as exc:
+        log.error("TLS certificate verification failed for index page: %s", exc)
     except Exception as exc:
         log.warning("Index scan failed: %s", exc)
 
@@ -156,7 +252,7 @@ def save_posted_date(day_key):
 
 def download_pdf(url, day_key):
     path = os.path.join(TEMP_DIR, f"{day_key}.pdf")
-    with requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, stream=True) as r:
+    with SESSION.get(url, timeout=REQUEST_TIMEOUT, stream=True) as r:
         r.raise_for_status()
         content_type = r.headers.get("content-type", "").lower()
         first_chunk = True
@@ -167,10 +263,17 @@ def download_pdf(url, day_key):
                 if first_chunk:
                     first_chunk = False
                     if not (chunk.startswith(b"%PDF") or "pdf" in content_type):
-                        raise ValueError("Downloaded file does not appear to be a PDF.")
+                        raise ValueError(
+                            f"Downloaded URL did not return a PDF "
+                            f"(content-type: {content_type})."
+                        )
                 f.write(chunk)
     if os.path.getsize(path) < 1000:
         raise ValueError("Downloaded PDF is unexpectedly small.")
+    # Validate the file before trying to render it.
+    with fitz.open(path) as doc:
+        if len(doc) == 0:
+            raise ValueError("PDF has no pages.")
     return path
 
 
@@ -178,12 +281,16 @@ def convert_pdf_to_jpg(pdf_path, day_key):
     doc = fitz.open(pdf_path)
     output_paths = []
     matrix = fitz.Matrix(RENDER_DPI / 72, RENDER_DPI / 72)
-    for index, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        out_path = os.path.join(TEMP_DIR, f"{day_key}_page_{index + 1:03d}.jpg")
-        pix.save(out_path, jpg_quality=90)
-        output_paths.append(out_path)
-    doc.close()
+    try:
+        for index, page in enumerate(doc):
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            out_path = os.path.join(
+                TEMP_DIR, f"{day_key}_page_{index + 1:03d}.jpg"
+            )
+            pix.save(out_path, jpg_quality=90)
+            output_paths.append(out_path)
+    finally:
+        doc.close()
     return output_paths
 
 
@@ -199,7 +306,11 @@ def post_images(bot, image_paths, day_key):
                 f = open(path, "rb")
                 opened.append(f)
                 page_number = start + offset + 1
-                caption = f"ရတနာပုံသတင်းစာ — {display_date}\nစာမျက်နှာ {page_number}/{total}" if offset == 0 else None
+                caption = (
+                    f"ရတနာပုံသတင်းစာ — {display_date}\n"
+                    f"စာမျက်နှာ {page_number}/{total}"
+                    if offset == 0 else None
+                )
                 media.append(InputMediaPhoto(media=f, caption=caption))
             bot.send_media_group(
                 chat_id=CHANNEL_ID, media=media,
@@ -220,7 +331,11 @@ def run_once():
 
     pdf_url = discover_today_pdf()
     if not pdf_url:
-        log.info("Today's PDF not found yet (%s). No post made; next scheduled run will retry.", day_key)
+        log.error(
+            "Today's PDF was not found (%s). Check TLS errors and the "
+            "Myawady page's embedded PDF viewer URL in the Actions logs.",
+            day_key
+        )
         return
 
     pdf_path = download_pdf(pdf_url, day_key)
@@ -235,11 +350,7 @@ def run_once():
 
 
 def main():
-    if "--once" in sys.argv:
-        run_once()
-        return
-
-    log.info("This project is designed for scheduled GitHub Actions runs. Use: python main.py --once")
+    log.info("Starting Yadanabon Daily Newspaper job.")
     run_once()
 
 
