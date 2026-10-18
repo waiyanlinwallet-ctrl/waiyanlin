@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: yadanabon-daily-news-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: CHECK_INTERVAL_MINUTES
+        value: "30"
+      - key: RENDER_DPI
+        value: "160"
+      - key: STATE_FILE
+        value: /data/posted_dates.txt
