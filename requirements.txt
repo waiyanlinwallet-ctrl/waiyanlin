@@ -2,3 +2,4 @@ python-telegram-bot>=21.0,<23.0
 requests>=2.31.0
 beautifulsoup4>=4.12.0
 PyMuPDF>=1.24.0
+certifi>=2025.1.31
