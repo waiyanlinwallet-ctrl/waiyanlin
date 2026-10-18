@@ -1,6 +1,7 @@
 import os
 import logging
 import tempfile
+import threading
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -36,6 +37,12 @@ WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
 
 app = Flask(__name__)
 session = requests.Session()
+
+# Telegram may retry webhook updates if processing a large PDF takes too long.
+# Acknowledge each update immediately and ignore duplicate update_id values.
+_seen_updates = set()
+_seen_updates_lock = threading.Lock()
+_MAX_SEEN_UPDATES = 5000
 session.headers.update({"User-Agent": "YadanabonPDFtoJPGBot/1.0"})
 
 
@@ -168,22 +175,43 @@ def health():
     return jsonify({"status": "ok", "service": "pdf-to-jpg-telegram-bot"}), 200
 
 
+def handle_update(update):
+    """Process an update outside the webhook request, so Telegram gets a fast 200."""
+    try:
+        message = update.get("message")
+        if message and message.get("document"):
+            process_document(message)
+        elif message and message.get("text") == "/start":
+            send_message(
+                message["chat"]["id"],
+                "မင်္ဂလာပါ။ သတင်းစာ PDF ဖိုင်ကို ဒီ Bot ဆီ ပို့ပါ။ "
+                "JPG ပုံပြောင်းပြီး သတ်မှတ်ထားတဲ့ Channel မှာ တင်ပေးပါမယ်။",
+            )
+    except Exception:
+        log.exception("Unhandled error while processing Telegram update")
+
+
 @app.post("/telegram-webhook")
 def telegram_webhook():
     if WEBHOOK_SECRET:
         provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if provided != WEBHOOK_SECRET:
             return jsonify({"ok": False, "error": "unauthorized"}), 403
+
     update = request.get_json(silent=True) or {}
-    message = update.get("message")
-    if message and message.get("document"):
-        process_document(message)
-    elif message and message.get("text") == "/start":
-        send_message(
-            message["chat"]["id"],
-            "မင်္ဂလာပါ။ သတင်းစာ PDF ဖိုင်ကို ဒီ Bot ဆီ ပို့ပါ။ "
-            "JPG ပုံပြောင်းပြီး သတ်မှတ်ထားတဲ့ Channel မှာ တင်ပေးပါမယ်။",
-        )
+    update_id = update.get("update_id")
+    if update_id is not None:
+        with _seen_updates_lock:
+            if update_id in _seen_updates:
+                log.info("Ignoring duplicate Telegram update_id=%s", update_id)
+                return jsonify({"ok": True, "duplicate": True}), 200
+            _seen_updates.add(update_id)
+            if len(_seen_updates) > _MAX_SEEN_UPDATES:
+                _seen_updates.clear()
+                _seen_updates.add(update_id)
+
+    # Start processing in the background and acknowledge Telegram immediately.
+    threading.Thread(target=handle_update, args=(update,), daemon=True).start()
     return jsonify({"ok": True}), 200
 
 
