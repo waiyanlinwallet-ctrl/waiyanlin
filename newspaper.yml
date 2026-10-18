@@ -1,0 +1,38 @@
+
+name: Yadanabon Daily Newspaper
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: yadanabon-newspaper
+  cancel-in-progress: false
+
+jobs:
+  post-newspaper:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run newspaper bot once
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          CHECK_INTERVAL_MINUTES: "30"
+          RENDER_DPI: "160"
+          STATE_FILE: state/posted_dates.txt
+        run: python main.py --once
