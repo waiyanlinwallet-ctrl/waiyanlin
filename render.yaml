@@ -1,0 +1,18 @@
+
+services:
+  - type: web
+    name: yadanabon-pdf-jpg-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: RENDER_DPI
+        value: "160"
+      - key: MAX_PDF_MB
+        value: "40"
+      - key: WEBHOOK_SECRET
+        generateValue: true
