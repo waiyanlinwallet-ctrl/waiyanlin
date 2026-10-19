@@ -5,6 +5,8 @@ import sqlite3
 import tempfile
 import threading
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -24,6 +26,8 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 RENDER_DPI = max(100, min(int(os.getenv("RENDER_DPI", "160")), 300))
 MAX_PDF_MB = max(1, int(os.getenv("MAX_PDF_MB", "40")))
 PORT = int(os.getenv("PORT", "10000"))
+# Only this Telegram account may use the bot.
+OWNER_USER_ID = 8863683428
 # Ignore an identical PDF for 24 hours after successful processing.
 DUPLICATE_WINDOW_SECONDS = 24 * 60 * 60
 DB_PATH = os.getenv("DEDUP_DB_PATH", "/tmp/pdf_jpg_seen.sqlite3")
@@ -242,7 +246,9 @@ def process_document(message, file_key):
         pdf_bytes = get_pdf_file(file_id)
         with tempfile.TemporaryDirectory(prefix="pdf-jpg-") as tmp:
             paths = pdf_to_jpegs(pdf_bytes, tmp)
-            caption = "ယနေ့ထုတ် ရတနာပုံသတင်းစာ"
+            # Use Myanmar local date, formatted like 19.Oct.2026.
+            today = datetime.now(ZoneInfo("Asia/Yangon")).strftime("%d.%b.%Y")
+            caption = f"ယနေ့ထုတ် ရတနာပုံသတင်းစာ ({today})"
             post_jpegs(paths, caption)
             count = len(paths)
         mark_document(file_key, "done")
@@ -290,6 +296,14 @@ def telegram_webhook():
             return jsonify({"ok": False, "error": "unauthorized"}), 403
 
     update = request.get_json(silent=True) or {}
+
+    # Owner-only access: ignore every update from other Telegram accounts.
+    incoming_message = update.get("message") or {}
+    incoming_user = incoming_message.get("from") or {}
+    if incoming_user.get("id") != OWNER_USER_ID:
+        log.info("Ignoring update from non-owner user_id=%s", incoming_user.get("id"))
+        return jsonify({"ok": True, "ignored": "owner_only"}), 200
+
     update_id = update.get("update_id")
     if update_id is not None:
         with _seen_updates_lock:
