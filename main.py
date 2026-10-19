@@ -26,8 +26,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 RENDER_DPI = max(100, min(int(os.getenv("RENDER_DPI", "160")), 300))
 MAX_PDF_MB = max(1, int(os.getenv("MAX_PDF_MB", "40")))
 PORT = int(os.getenv("PORT", "10000"))
+
 # Only this Telegram account may use the bot.
 OWNER_USER_ID = 8863683428
+
 # Ignore an identical PDF for 24 hours after successful processing.
 DUPLICATE_WINDOW_SECONDS = 24 * 60 * 60
 DB_PATH = os.getenv("DEDUP_DB_PATH", "/tmp/pdf_jpg_seen.sqlite3")
@@ -47,7 +49,7 @@ WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
 
 app = Flask(__name__)
 session = requests.Session()
-session.headers.update({"User-Agent": "YadanabonPDFtoJPGBot/1.1"})
+session.headers.update({"User-Agent": "YadanabonPDFtoJPGBot/1.2"})
 
 _seen_updates = set()
 _seen_updates_lock = threading.Lock()
@@ -67,7 +69,7 @@ def init_db():
 
 
 def claim_document(file_key):
-    """Return True only when this PDF has not already been processed recently."""
+    """Return True only if this PDF is not already processing or done recently."""
     now = int(time.time())
     cutoff = now - DUPLICATE_WINDOW_SECONDS
     with _db_lock:
@@ -106,7 +108,12 @@ def telegram(method, data=None, files=None, timeout=60):
     response = session.post(
         f"{API}/{method}", data=data, files=files, timeout=timeout
     )
-    response.raise_for_status()
+    # Include Telegram's response body in logs to make failures diagnosable.
+    try:
+        response.raise_for_status()
+    except requests.RequestException:
+        log.error("Telegram API %s HTTP %s: %s", method, response.status_code, response.text[:1000])
+        raise
     result = response.json()
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API {method} failed: {result}")
@@ -121,7 +128,6 @@ def send_message(chat_id, text, reply_markup=None):
 
 
 def set_bot_commands():
-    """Add the Telegram menu command so users can tap /start easily."""
     telegram(
         "setMyCommands",
         {
@@ -134,6 +140,7 @@ def set_bot_commands():
             )
         },
     )
+    log.info("Telegram bot commands configured")
 
 
 def welcome_message(chat_id):
@@ -193,6 +200,7 @@ def pdf_to_jpegs(pdf_bytes, output_dir):
             raise ValueError("PDF has no pages")
         if doc.page_count > 500:
             raise ValueError("PDF has more than 500 pages; refusing to process it")
+        log.info("Converting PDF: %s pages at %s DPI", doc.page_count, RENDER_DPI)
         for index, page in enumerate(doc):
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             output_path = Path(output_dir) / f"page_{index + 1:04d}.jpg"
@@ -203,7 +211,8 @@ def pdf_to_jpegs(pdf_bytes, output_dir):
 
 def post_jpegs(paths, caption):
     # Telegram media groups allow at most 10 items per group.
-    for start in range(0, len(paths), 10):
+    total_batches = (len(paths) + 9) // 10
+    for batch_number, start in enumerate(range(0, len(paths), 10), start=1):
         batch = paths[start:start + 10]
         opened = []
         media = []
@@ -216,12 +225,17 @@ def post_jpegs(paths, caption):
                     item["caption"] = caption[:1024]
                 media.append(item)
             multipart = {f"photo{i}": handle for i, handle in enumerate(opened)}
+            log.info(
+                "Posting JPG batch %s/%s (%s images) to channel",
+                batch_number, total_batches, len(batch)
+            )
             telegram(
                 "sendMediaGroup",
-                {"chat_id": CHANNEL_ID, "media": json.dumps(media)},
+                {"chat_id": CHANNEL_ID, "media": json.dumps(media, ensure_ascii=False)},
                 files=multipart,
                 timeout=180,
             )
+            log.info("Posted JPG batch %s/%s successfully", batch_number, total_batches)
         finally:
             for handle in opened:
                 handle.close()
@@ -234,6 +248,7 @@ def process_document(message, file_key):
     mime_type = document.get("mime_type", "")
     file_id = document.get("file_id")
     try:
+        log.info("Received PDF request from owner; filename=%s", filename)
         if not file_id:
             raise ValueError("ဖိုင်ကို မဖတ်နိုင်ပါ။ PDF ဖိုင်ကို ပြန်ပို့ပေးပါ။")
         if not filename.lower().endswith(".pdf") and mime_type != "application/pdf":
@@ -246,12 +261,12 @@ def process_document(message, file_key):
         pdf_bytes = get_pdf_file(file_id)
         with tempfile.TemporaryDirectory(prefix="pdf-jpg-") as tmp:
             paths = pdf_to_jpegs(pdf_bytes, tmp)
-            # Use Myanmar local date, formatted like 19.Oct.2026.
             today = datetime.now(ZoneInfo("Asia/Yangon")).strftime("%d.%b.%Y")
             caption = f"ယနေ့ထုတ် ရတနာပုံသတင်းစာ ({today})"
             post_jpegs(paths, caption)
             count = len(paths)
         mark_document(file_key, "done")
+        log.info("PDF processing completed; posted %s JPG images", count)
         send_message(chat_id, f"ပြီးပါပြီ။ JPG ပုံ {count} ပုံကို Channel မှာ တင်ပြီးပါပြီ။")
     except Exception as exc:
         mark_document(file_key, "failed")
@@ -260,7 +275,10 @@ def process_document(message, file_key):
             if isinstance(exc, ValueError) and str(exc).startswith(("PDF ဖိုင်", "PDF ဖိုင်ကို", "ဖိုင်ကို")):
                 error_text = str(exc)
             else:
-                error_text = "PDF ပြောင်းပြီး Channel တင်ရာမှာ အမှားဖြစ်သွားပါတယ်။ Render Logs ကို စစ်ဆေးပေးပါ။"
+                error_text = (
+                    "PDF ပြောင်းပြီး Channel တင်ရာမှာ အမှားဖြစ်သွားပါတယ်။ "
+                    "Render Logs ကို စစ်ဆေးပေးပါ။"
+                )
             send_message(chat_id, error_text)
         except Exception:
             log.exception("Could not send error message")
@@ -319,13 +337,19 @@ def telegram_webhook():
     document = message.get("document") or {}
     file_key = None
     if document:
-        # file_unique_id remains stable when the same PDF is sent again.
         file_key = str(document.get("file_unique_id") or document.get("file_id") or "")
         if not file_key:
             return jsonify({"ok": True, "ignored": "missing file id"}), 200
         try:
             if not claim_document(file_key):
                 log.info("Ignoring recently processed PDF file_key=%s", file_key)
+                # Let the owner know why this PDF was not reposted.
+                threading.Thread(
+                    target=send_message,
+                    args=(message["chat"]["id"],
+                          "ဒီ PDF ဖိုင်ကို ၂၄ နာရီအတွင်း ပို့ပြီးသားဖြစ်လို့ ထပ်မတင်ထားပါဘူး။"),
+                    daemon=True,
+                ).start()
                 return jsonify({"ok": True, "duplicate_document": True}), 200
         except Exception:
             log.exception("Deduplication database error; refusing to process to avoid duplicate posts")
@@ -338,6 +362,7 @@ def telegram_webhook():
 
 @app.post("/configure-webhook")
 def configure_webhook():
+    # Use only when manually fixing/reconnecting the webhook; do not call on every startup.
     if WEBHOOK_SECRET:
         provided = request.headers.get("X-Webhook-Secret", "")
         if provided != WEBHOOK_SECRET:
@@ -350,20 +375,26 @@ def configure_webhook():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
-# Initialize deduplication storage on app startup.
+@app.post("/configure-commands")
+def configure_commands():
+    # Optional manual endpoint to restore /start and /help commands.
+    if WEBHOOK_SECRET:
+        provided = request.headers.get("X-Webhook-Secret", "")
+        if provided != WEBHOOK_SECRET:
+            return jsonify({"ok": False, "error": "unauthorized"}), 403
+    try:
+        set_bot_commands()
+        return jsonify({"ok": True}), 200
+    except Exception as exc:
+        log.exception("Could not configure Telegram bot commands")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+# Initialize deduplication storage. Do NOT call setWebhook or setMyCommands here:
+# Gunicorn imports this module at startup, and repeated Telegram API calls can cause 429.
 init_db()
+log.info("Application initialized. Existing Telegram webhook is left unchanged.")
 
-# Gunicorn imports this module, so configure the Telegram menu and webhook on startup.
-try:
-    set_bot_commands()
-    log.info("Telegram bot commands configured")
-except Exception:
-    log.exception("Could not configure Telegram bot commands at startup")
-
-try:
-    set_webhook()
-except Exception:
-    log.exception("Could not configure Telegram webhook at startup")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
