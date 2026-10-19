@@ -109,8 +109,43 @@ def telegram(method, data=None, files=None, timeout=60):
     return result["result"]
 
 
-def send_message(chat_id, text):
-    telegram("sendMessage", {"chat_id": chat_id, "text": text})
+def send_message(chat_id, text, reply_markup=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+    telegram("sendMessage", payload)
+
+
+def set_bot_commands():
+    """Add the Telegram menu command so users can tap /start easily."""
+    telegram(
+        "setMyCommands",
+        {
+            "commands": json.dumps(
+                [
+                    {"command": "start", "description": "စတင်ရန်"},
+                    {"command": "help", "description": "အသုံးပြုပုံ"},
+                ],
+                ensure_ascii=False,
+            )
+        },
+    )
+
+
+def welcome_message(chat_id):
+    keyboard = {
+        "keyboard": [[{"text": "📄 PDF စတင်ပို့ရန်"}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+        "input_field_placeholder": "PDF ဖိုင်ကို ဒီမှာ ပို့ပါ",
+    }
+    send_message(
+        chat_id,
+        "မင်္ဂလာပါ။ ယနေ့ထုတ် ရတနာပုံသတင်းစာ PDF ကို ဒီ Bot ဆီ ပို့ပါ။\n"
+        "PDF စာမျက်နှာတိုင်းကို JPG ပြောင်းပြီး Channel မှာ တင်ပေးပါမယ်။\n\n"
+        "စတင်ရန် အောက်က 📄 PDF စတင်ပို့ရန် ခလုတ်ကို နှိပ်ပြီး PDF ဖိုင်ကို ပို့ပါ။",
+        keyboard,
+    )
 
 
 def set_webhook():
@@ -207,7 +242,7 @@ def process_document(message, file_key):
         pdf_bytes = get_pdf_file(file_id)
         with tempfile.TemporaryDirectory(prefix="pdf-jpg-") as tmp:
             paths = pdf_to_jpegs(pdf_bytes, tmp)
-            caption = f"{filename} — စာမျက်နှာ {len(paths)} မျက်နှာ"
+            caption = "ယနေ့ထုတ် ရတနာပုံသတင်းစာ"
             post_jpegs(paths, caption)
             count = len(paths)
         mark_document(file_key, "done")
@@ -230,11 +265,13 @@ def handle_update(update, file_key=None):
         message = update.get("message")
         if message and message.get("document") and file_key:
             process_document(message, file_key)
-        elif message and message.get("text") == "/start":
+        elif message and message.get("text", "").split("@")[0] in ("/start", "/help"):
+            welcome_message(message["chat"]["id"])
+        elif message and message.get("text") == "📄 PDF စတင်ပို့ရန်":
             send_message(
                 message["chat"]["id"],
-                "မင်္ဂလာပါ။ သတင်းစာ PDF ဖိုင်ကို ဒီ Bot ဆီ ပို့ပါ။ "
-                "JPG ပုံပြောင်းပြီး သတ်မှတ်ထားတဲ့ Channel မှာ တင်ပေးပါမယ်။",
+                "အခု ယနေ့ထုတ် ရတနာပုံသတင်းစာ PDF ဖိုင်ကို ပို့ပေးပါ။\n"
+                "စာမျက်နှာအားလုံးကို JPG ပြောင်းပြီး Channel မှာ တင်ပေးပါမယ်။",
             )
     except Exception:
         log.exception("Unhandled error while processing Telegram update")
@@ -302,7 +339,17 @@ def configure_webhook():
 # Initialize deduplication storage on app startup.
 init_db()
 
-# Configure webhook at startup when this file is run directly.
-if __name__ == "__main__":
+# Gunicorn imports this module, so configure the Telegram menu and webhook on startup.
+try:
+    set_bot_commands()
+    log.info("Telegram bot commands configured")
+except Exception:
+    log.exception("Could not configure Telegram bot commands at startup")
+
+try:
     set_webhook()
+except Exception:
+    log.exception("Could not configure Telegram webhook at startup")
+
+if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
