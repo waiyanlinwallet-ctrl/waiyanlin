@@ -1,7 +1,10 @@
 import os
+import json
 import logging
+import sqlite3
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -21,6 +24,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
 RENDER_DPI = max(100, min(int(os.getenv("RENDER_DPI", "160")), 300))
 MAX_PDF_MB = max(1, int(os.getenv("MAX_PDF_MB", "40")))
 PORT = int(os.getenv("PORT", "10000"))
+# Ignore an identical PDF for 24 hours after successful processing.
+DUPLICATE_WINDOW_SECONDS = 24 * 60 * 60
+DB_PATH = os.getenv("DEDUP_DB_PATH", "/tmp/pdf_jpg_seen.sqlite3")
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN environment variable")
@@ -37,13 +43,59 @@ WEBHOOK_URL = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
 
 app = Flask(__name__)
 session = requests.Session()
+session.headers.update({"User-Agent": "YadanabonPDFtoJPGBot/1.1"})
 
-# Telegram may retry webhook updates if processing a large PDF takes too long.
-# Acknowledge each update immediately and ignore duplicate update_id values.
 _seen_updates = set()
 _seen_updates_lock = threading.Lock()
 _MAX_SEEN_UPDATES = 5000
-session.headers.update({"User-Agent": "YadanabonPDFtoJPGBot/1.0"})
+_db_lock = threading.Lock()
+
+
+def init_db():
+    with _db_lock:
+        with sqlite3.connect(DB_PATH, timeout=30) as db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS processed_docs ("
+                "file_key TEXT PRIMARY KEY, processed_at INTEGER NOT NULL, "
+                "status TEXT NOT NULL)"
+            )
+            db.commit()
+
+
+def claim_document(file_key):
+    """Return True only when this PDF has not already been processed recently."""
+    now = int(time.time())
+    cutoff = now - DUPLICATE_WINDOW_SECONDS
+    with _db_lock:
+        with sqlite3.connect(DB_PATH, timeout=30) as db:
+            db.execute("DELETE FROM processed_docs WHERE processed_at < ?", (cutoff,))
+            row = db.execute(
+                "SELECT status FROM processed_docs WHERE file_key = ?", (file_key,)
+            ).fetchone()
+            if row and row[0] in ("processing", "done"):
+                db.commit()
+                return False
+            db.execute(
+                "INSERT OR REPLACE INTO processed_docs(file_key, processed_at, status) "
+                "VALUES (?, ?, 'processing')",
+                (file_key, now),
+            )
+            db.commit()
+            return True
+
+
+def mark_document(file_key, status):
+    with _db_lock:
+        with sqlite3.connect(DB_PATH, timeout=30) as db:
+            if status == "failed":
+                # Allow the user to retry a failed PDF immediately.
+                db.execute("DELETE FROM processed_docs WHERE file_key = ?", (file_key,))
+            else:
+                db.execute(
+                    "UPDATE processed_docs SET processed_at = ?, status = ? WHERE file_key = ?",
+                    (int(time.time()), status, file_key),
+                )
+            db.commit()
 
 
 def telegram(method, data=None, files=None, timeout=60):
@@ -127,7 +179,7 @@ def post_jpegs(paths, caption):
             multipart = {f"photo{i}": handle for i, handle in enumerate(opened)}
             telegram(
                 "sendMediaGroup",
-                {"chat_id": CHANNEL_ID, "media": __import__("json").dumps(media)},
+                {"chat_id": CHANNEL_ID, "media": json.dumps(media)},
                 files=multipart,
                 timeout=180,
             )
@@ -136,51 +188,48 @@ def post_jpegs(paths, caption):
                 handle.close()
 
 
-def process_document(message):
+def process_document(message, file_key):
     chat_id = message["chat"]["id"]
     document = message.get("document") or {}
     filename = document.get("file_name", "document.pdf")
     mime_type = document.get("mime_type", "")
     file_id = document.get("file_id")
-    if not file_id:
-        send_message(chat_id, "ဖိုင်ကို မဖတ်နိုင်ပါ။ PDF ဖိုင်ကို ပြန်ပို့ပေးပါ။")
-        return
-    if not filename.lower().endswith(".pdf") and mime_type != "application/pdf":
-        send_message(chat_id, "PDF ဖိုင်ကိုပဲ ပို့ပေးပါ။")
-        return
-    size = int(document.get("file_size") or 0)
-    if size > MAX_PDF_MB * 1024 * 1024:
-        send_message(chat_id, f"PDF ဖိုင်က {MAX_PDF_MB} MB ထက်ကြီးနေပါတယ်။")
-        return
-
-    send_message(chat_id, "PDF လက်ခံရရှိပါပြီ။ JPG ပုံတွေပြောင်းပြီး Channel မှာ တင်နေပါတယ်။")
     try:
+        if not file_id:
+            raise ValueError("ဖိုင်ကို မဖတ်နိုင်ပါ။ PDF ဖိုင်ကို ပြန်ပို့ပေးပါ။")
+        if not filename.lower().endswith(".pdf") and mime_type != "application/pdf":
+            raise ValueError("PDF ဖိုင်ကိုပဲ ပို့ပေးပါ။")
+        size = int(document.get("file_size") or 0)
+        if size > MAX_PDF_MB * 1024 * 1024:
+            raise ValueError(f"PDF ဖိုင်က {MAX_PDF_MB} MB ထက်ကြီးနေပါတယ်။")
+
+        send_message(chat_id, "PDF လက်ခံရရှိပါပြီ။ JPG ပုံတွေပြောင်းပြီး Channel မှာ တင်နေပါတယ်။")
         pdf_bytes = get_pdf_file(file_id)
         with tempfile.TemporaryDirectory(prefix="pdf-jpg-") as tmp:
             paths = pdf_to_jpegs(pdf_bytes, tmp)
             caption = f"{filename} — စာမျက်နှာ {len(paths)} မျက်နှာ"
             post_jpegs(paths, caption)
-        send_message(chat_id, f"ပြီးပါပြီ။ JPG ပုံ {len(paths)} ပုံကို Channel မှာ တင်ပြီးပါပြီ။")
-    except Exception:
+            count = len(paths)
+        mark_document(file_key, "done")
+        send_message(chat_id, f"ပြီးပါပြီ။ JPG ပုံ {count} ပုံကို Channel မှာ တင်ပြီးပါပြီ။")
+    except Exception as exc:
+        mark_document(file_key, "failed")
         log.exception("Failed to process PDF")
-        send_message(
-            chat_id,
-            "PDF ပြောင်းပြီး Channel တင်ရာမှာ အမှားဖြစ်သွားပါတယ်။ "
-            "Render Logs ကို စစ်ဆေးပေးပါ။",
-        )
+        try:
+            if isinstance(exc, ValueError) and str(exc).startswith(("PDF ဖိုင်", "PDF ဖိုင်ကို", "ဖိုင်ကို")):
+                error_text = str(exc)
+            else:
+                error_text = "PDF ပြောင်းပြီး Channel တင်ရာမှာ အမှားဖြစ်သွားပါတယ်။ Render Logs ကို စစ်ဆေးပေးပါ။"
+            send_message(chat_id, error_text)
+        except Exception:
+            log.exception("Could not send error message")
 
 
-@app.get("/")
-def health():
-    return jsonify({"status": "ok", "service": "pdf-to-jpg-telegram-bot"}), 200
-
-
-def handle_update(update):
-    """Process an update outside the webhook request, so Telegram gets a fast 200."""
+def handle_update(update, file_key=None):
     try:
         message = update.get("message")
-        if message and message.get("document"):
-            process_document(message)
+        if message and message.get("document") and file_key:
+            process_document(message, file_key)
         elif message and message.get("text") == "/start":
             send_message(
                 message["chat"]["id"],
@@ -189,6 +238,11 @@ def handle_update(update):
             )
     except Exception:
         log.exception("Unhandled error while processing Telegram update")
+
+
+@app.get("/")
+def health():
+    return jsonify({"status": "ok", "service": "pdf-to-jpg-telegram-bot"}), 200
 
 
 @app.post("/telegram-webhook")
@@ -210,14 +264,29 @@ def telegram_webhook():
                 _seen_updates.clear()
                 _seen_updates.add(update_id)
 
-    # Start processing in the background and acknowledge Telegram immediately.
-    threading.Thread(target=handle_update, args=(update,), daemon=True).start()
+    message = update.get("message") or {}
+    document = message.get("document") or {}
+    file_key = None
+    if document:
+        # file_unique_id remains stable when the same PDF is sent again.
+        file_key = str(document.get("file_unique_id") or document.get("file_id") or "")
+        if not file_key:
+            return jsonify({"ok": True, "ignored": "missing file id"}), 200
+        try:
+            if not claim_document(file_key):
+                log.info("Ignoring recently processed PDF file_key=%s", file_key)
+                return jsonify({"ok": True, "duplicate_document": True}), 200
+        except Exception:
+            log.exception("Deduplication database error; refusing to process to avoid duplicate posts")
+            return jsonify({"ok": False, "error": "deduplication database unavailable"}), 500
+
+    # Acknowledge Telegram immediately, then process in the background.
+    threading.Thread(target=handle_update, args=(update, file_key), daemon=True).start()
     return jsonify({"ok": True}), 200
 
 
 @app.post("/configure-webhook")
 def configure_webhook():
-    # Optional manual endpoint for troubleshooting; protect with WEBHOOK_SECRET if configured.
     if WEBHOOK_SECRET:
         provided = request.headers.get("X-Webhook-Secret", "")
         if provided != WEBHOOK_SECRET:
@@ -230,6 +299,10 @@ def configure_webhook():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+# Initialize deduplication storage on app startup.
+init_db()
+
+# Configure webhook at startup when this file is run directly.
 if __name__ == "__main__":
     set_webhook()
     app.run(host="0.0.0.0", port=PORT)
